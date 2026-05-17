@@ -14,8 +14,7 @@ import os
 from pathlib import Path
 
 import yaml
-
-from .parser import parse_problem, parse_original_problem
+from .original_parser import parse_problem, parse_original_problem
 from .codegen import CodeGenerator
 from .subproblem_compiler import SubproblemCompiler
 from .subproblem_models import subproblem_to_dict

@@ -14,6 +14,7 @@ Lifecycle:
   3. subproblem_to_dict()  →  dict for YAML serialization
 """
 
+import re
 from typing import Dict, List, Optional, Tuple
 
 from .original_problem import (
@@ -394,8 +395,10 @@ class SubproblemCompiler:
             n_nodes_in_range = len(nodes)
 
             expr = ineq.expr
-            is_box = ("<=" in expr and "=" not in expr.replace("<=", "")) and \
-                     expr.count("<=") == 2
+            is_box = bool(re.match(
+                r'^[\w\.\[\]]+\s*<=\s*[\w\.\[\]]+\[k\]\s*<=\s*[\w\.\[\]]+$',
+                expr.replace(' ', '')
+            ))
 
             if is_box:
                 # Split into two canonical blocks: lower first, then upper
@@ -557,11 +560,12 @@ class SubproblemCompiler:
                         expr_str = f"{obj.weight} * ({obj.integrand})" if obj.weight else obj.integrand
                         nodes = self._resolve_range(obj.range, p.final_node)
                         rng = [nodes[0], nodes[-1]] if nodes else None
+                        term_type = "integral_quadratic" if self._is_quadratic_expr(obj.integrand) else "integral_linear"
                         terms.append(ObjectiveTerm(
                             id=obj.objective_id,
                             source_model=src_path,
                             source_operation=op.id,
-                            type="integral_quadratic" if "^2" in obj.integrand else "integral_linear",
+                            type=term_type,
                             grid=obj.grid,
                             range=rng,
                             expr=expr_str,
@@ -569,7 +573,7 @@ class SubproblemCompiler:
 
             if op.effects and op.effects.adds_objective_terms:
                 for ao in op.effects.adds_objective_terms:
-                    term_type = "scalar_quadratic" if "^2" in ao.expr else "linear"
+                    term_type = "scalar_quadratic" if self._is_quadratic_expr(ao.expr) else "linear"
                     terms.append(ObjectiveTerm(
                         id=f"{op.id}_penalty",
                         source_model="",
@@ -652,7 +656,18 @@ class SubproblemCompiler:
         return None
 
     @staticmethod
-    def _split_box_expr(expr: str) -> tuple:
+    def _is_quadratic_expr(expr: str) -> bool:
+        """Detect if expression contains quadratic terms."""
+        # Match patterns like x^2, x**2, x[k]*x[k], or cross terms like x[k]*y[k]
+        patterns = [
+            r'\w+\s*\^\s*2',        # x^2
+            r'\w+\s*\*\*\s*2',      # x**2
+            r'\w+\[k\]\s*\*\s*\w+\[k\]',  # x[k]*x[k] or x[k]*y[k]
+        ]
+        return any(re.search(p, expr) for p in patterns)
+
+    @staticmethod
+    def _split_box_expr(expr: str) -> Tuple[str, str]:
         """Split 'lower <= var[k] <= upper' into (lower_expr, upper_expr).
 
         Returns:

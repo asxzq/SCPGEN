@@ -14,8 +14,7 @@ import os
 from pathlib import Path
 
 import yaml
-from .original_parser import parse_problem, parse_original_problem
-from .codegen import CodeGenerator
+from .original_parser import parse_original_problem
 from .subproblem_compiler import SubproblemCompiler
 from .subproblem_models import subproblem_to_dict
 from .subproblem_validator import validate_subproblem
@@ -60,64 +59,43 @@ def cmd_compile(args):
 
 
 def cmd_generate(args):
-    """Generate C source files from a problem description."""
-    model, trans = parse_problem(args.input)
-    gen = CodeGenerator(model, trans)
-
-    outputs = gen.run_pipeline()
-
-    out_dir = args.output or "output"
-    written = gen.write_outputs(out_dir)
-
-    print(f"Generated {len(written)} file(s) in '{out_dir}':")
-    for f in written:
-        print(f"  {f}")
+    """Generate C source files from a subproblem description (Stage 2)."""
+    print("Stage 2 (C code generation) is not yet implemented.")
+    print("Use 'scpgen compile' to generate subproblem.yaml (Stage 1).")
+    sys.exit(1)
 
 
 def cmd_validate(args):
-    """Validate a problem description YAML file."""
+    """Validate an original problem YAML file."""
     try:
-        model, trans = parse_problem(args.input)
-        print(f"✓ Valid problem: '{model.name}'")
-        print(f"  States:      {len(model.states)} ({', '.join(s.name for s in model.states)})")
-        print(f"  Controls:    {len(model.controls)} ({', '.join(c.name for c in model.controls)})")
-        print(f"  Nodes (N):   {model.N}")
-        print(f"  Dynamics:    {len(model.dynamics)} equations")
-        print(f"  Eq cons:     {len(model.eq_constraints)}")
-        print(f"  Ineq cons:   {len(model.ineq_constraints)}")
-        print(f"  Operations:  {len(trans.operations)}")
-        print(f"  Ext funcs:   {len(model.external_funcs)}")
+        problem = parse_original_problem(args.input)
+        print(f"Valid problem: '{problem.meta.name}'")
+        print(f"  States:      {problem.n_states} ({', '.join(problem.model.variables.state_names)})")
+        print(f"  Controls:    {problem.n_controls} ({', '.join(problem.model.variables.control_names)})")
+        print(f"  Nodes (N):   {problem.N}")
+        print(f"  Dynamics:    {len(problem.model.dynamics)} equations")
+        print(f"  Eq cons:     {len(problem.model.equalities)}")
+        print(f"  Ineq cons:   {len(problem.model.inequalities)}")
+        print(f"  Operations:  {len(problem.transcription.operations)}")
+        print(f"  Expressions: {len(problem.model.expressions)}")
     except Exception as e:
-        print(f"✗ Validation failed: {e}")
+        print(f"Validation failed: {e}")
         sys.exit(1)
 
 
 def cmd_info(args):
-    """Print detailed info about a problem description."""
-    model, trans = parse_problem(args.input)
-
-    from .discretizer import IndexMap
-    from .symengine import SymContext, generate_symbolic_dynamics_jacobian
-
-    idx = IndexMap(model, trans)
-    sym = SymContext(model)
-
-    print(f"Problem: {model.name}")
-    print(f"{'='*60}")
-    print(idx.summary())
-    print()
-
-    # Symbolic dynamics Jacobian dimensions
-    jac = generate_symbolic_dynamics_jacobian(sym, 0)
-    print(f"Dynamics Jacobian (at symbolic node 0):")
-    print(f"  A (∂f/∂x): {jac['A'].rows}×{jac['A'].cols}")
-    print(f"  B (∂f/∂u): {jac['B'].rows}×{jac['B'].cols}")
-    print()
-
-    print("Transcription operations:")
-    for op in trans.operations:
-        targets = [e.target.value for e in op.exports]
-        print(f"  {op.type:30s} → {', '.join(targets)}")
+    """Print problem summary from an original YAML file."""
+    try:
+        problem = parse_original_problem(args.input)
+        print(f"Problem: {problem.meta.name}")
+        print(f"  Version: {problem.meta.version}")
+        print(f"  N = {problem.N} intervals ({problem.n_nodes} nodes)")
+        print(f"  Variables: {problem.n_states} states + {problem.n_controls} controls = {problem.vars_per_node}/node")
+        print(f"  Time mode: {problem.grid.time.interval_mode}")
+        print(f"  Discretization: {problem.transcription.discretization_mode}")
+    except Exception as e:
+        print(f"Failed to load problem: {e}")
+        sys.exit(1)
 
 
 def main():

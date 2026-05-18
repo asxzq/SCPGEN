@@ -12,10 +12,15 @@ Produces a subproblem_validation_report.md after checking:
   - Scalar slacks have grid=scalar and 1 row (not node-expanded)
   - Time perturbation variable exists iff optimizable
   - No solver-specific fields (Q_c, G_h_q, soc_epigraph)
+  - All objective terms have role
+  - Nonlinear original_cost objectives have approximation
+  - Quadratic terms not mislabeled as linear
+  - Slack penalty references exist in extra_variables
+  - Trust region penalties have defined scope
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from .subproblem_models import SubProblemDef
 
@@ -70,11 +75,23 @@ class ValidationReport:
         return "\n".join(lines)
 
 
-def validate_subproblem(sp: SubProblemDef) -> ValidationReport:
+def validate_subproblem(
+    sp: SubProblemDef,
+    original_scales: Optional[Dict[str, object]] = None,
+) -> ValidationReport:
     """
     Run all validation checks on a SubProblemDef.
 
-    Returns a ValidationReport with pass/fail for each check.
+    Args:
+        sp: The compiled subproblem definition.
+        original_scales: Optional dict with scale entries for reference validation.
+            If provided, should contain entries in the format:
+              - "variables": list of (name, scale_name) tuples for node variables
+              - "extra_variables": list of (name, scale_name) tuples for extra variables
+              - "parameters": dict of parameter_name -> scale_name
+              - "expressions": list of expression strings
+              - "scales": ScaleDef or list of scale names for direct validation
+            If None, scale reference checks are skipped (for legacy/compatibility).
     """
     checks: List[ValidationCheck] = []
 
@@ -108,14 +125,32 @@ def validate_subproblem(sp: SubProblemDef) -> ValidationReport:
     # ── Check 10: No solver-specific objective rewrite ──
     checks.append(_check_no_solver_specific_fields(sp))
 
-    # ── Check 11: Time perturbation if optimizable ──
-    checks.append(_check_time_perturbation_present(sp))
+    # ── Check 11: Time variable three-way rule ──
+    checks.append(_check_time_variable(sp))
 
-    # ── Check 12: No time perturbation if fixed_interval ──
-    checks.append(_check_no_time_perturbation_if_fixed(sp))
+    # ── Check 12: All objective terms have role ──
+    checks.append(_check_objective_terms_have_role(sp))
 
-    # ── Check 13: row_end = row_start + row_count - 1 ──
+    # ── Check 13: Nonlinear original_cost has approximation ──
+    checks.append(_check_nonlinear_objective_has_approximation(sp))
+
+    # ── Check 14: Quadratic not mislabeled as linear ──
+    checks.append(_check_quadratic_not_mislabeled(sp))
+
+    # ── Check 15: Slack penalty refs exist ──
+    checks.append(_check_slack_penalty_refs_exist(sp))
+
+    # ── Check 16: Trust region has scope ──
+    checks.append(_check_trust_region_has_scope(sp))
+
+    # ── Check 17: row_end = row_start + row_count - 1 ──
     checks.append(_check_row_end_formula(sp))
+
+    # ── Check 18: All scale references exist in resolved scale_table ──
+    checks.append(_check_scale_references(sp, original_scales))
+
+    # ── Check 19: Scale table is fully resolved (no missing values) ──
+    checks.append(_check_scale_table_complete(sp))
 
     return ValidationReport(checks=checks)
 
@@ -329,8 +364,7 @@ def _check_scalar_slacks_not_node(sp: SubProblemDef) -> ValidationCheck:
 
 
 def _check_no_solver_specific_fields(sp: SubProblemDef) -> ValidationCheck:
-    """The subproblem must not contain Q_c, G_h_q, soc_epigraph, etc."""
-    # We check that no block has export other than A_b, G_h, or objective
+    """The subproblem must not contain Q_c, G_h_q, soc_epigraph, ECOS, etc."""
     issues = []
     for blk in sp.equalities.blocks:
         if blk.export not in ("A_b",):
@@ -339,48 +373,229 @@ def _check_no_solver_specific_fields(sp: SubProblemDef) -> ValidationCheck:
         if blk.export not in ("G_h",):
             issues.append(f"Inequality block '{blk.id}' has export='{blk.export}' (expected G_h)")
 
+    # Also check objective terms for solver-specific leaking
+    for term in sp.objective.terms:
+        forbidden = ["Q_c", "G_h_q", "soc_epigraph", "ECOS", "ecos"]
+        for kw in forbidden:
+            combined = f"{term.stage2_action} {term.stage3_action} {term.next_stage_action}".lower()
+            if kw.lower() in combined:
+                issues.append(
+                    f"Objective term '{term.id}' references '{kw}' in "
+                    f"stage2_action='{term.stage2_action}' "
+                    f"stage3_action='{term.stage3_action}'"
+                )
+
     if issues:
         return ValidationCheck(
-            name="no_solver_specific_objective_rewrite_in_subproblem",
+            name="no_solver_specific_fields",
             passed=False,
             detail="; ".join(issues),
         )
-    return ValidationCheck(name="no_solver_specific_objective_rewrite_in_subproblem", passed=True)
+    return ValidationCheck(name="no_solver_specific_fields", passed=True)
 
 
-def _check_time_perturbation_present(sp: SubProblemDef) -> ValidationCheck:
-    """If interval_mode is optimizable_uniform_interval, dT must exist."""
-    if sp.time.interval_mode == "optimizable_uniform_interval":
-        if sp.time.perturbation_variable is None:
-            return ValidationCheck(
-                name="time_perturbation_variable_present_if_optimizable",
-                passed=False,
-                detail="interval_mode is optimizable_uniform_interval but perturbation_variable is null",
+# ═══════════════════════════════════════════════════════════════════════════════
+# Objective-specific checks (Stage1 objective refactoring)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _check_objective_terms_have_role(sp: SubProblemDef) -> ValidationCheck:
+    """All objective terms must have a non-empty 'role' field."""
+    issues = []
+    for term in sp.objective.terms:
+        if not term.role or term.role.strip() == "":
+            issues.append(
+                f"Objective term '{term.id}' has empty 'role'. "
+                f"Must be one of: original_cost, smoothing_penalty, "
+                f"slack_penalty, trust_region_penalty, virtual_control_penalty"
             )
-        # Also check the variable exists in extra_variables
-        found = any(
-            v.name == sp.time.perturbation_variable
-            for v in sp.variables.extra_variables
+    if issues:
+        return ValidationCheck(
+            name="objective_terms_have_role",
+            passed=False,
+            detail="; ".join(issues),
         )
+    return ValidationCheck(name="objective_terms_have_role", passed=True)
+
+
+def _check_nonlinear_objective_has_approximation(sp: SubProblemDef) -> ValidationCheck:
+    """Nonlinear original_cost objectives must have first_order or exact_convex approximation."""
+    issues = []
+    for term in sp.objective.terms:
+        if term.role == "original_cost" and term.expression_type == "nonlinear":
+            if term.approximation not in ("first_order", "exact_convex"):
+                issues.append(
+                    f"Objective term '{term.id}' is nonlinear original_cost but has "
+                    f"approximation='{term.approximation}'. "
+                    f"Must be 'first_order' or 'exact_convex'."
+                )
+    if issues:
+        return ValidationCheck(
+            name="nonlinear_objective_has_approximation",
+            passed=False,
+            detail="; ".join(issues),
+        )
+    return ValidationCheck(name="nonlinear_objective_has_approximation", passed=True)
+
+
+def _check_quadratic_not_mislabeled(sp: SubProblemDef) -> ValidationCheck:
+    """Quadratic terms must not be mislabeled as linear_cost, and vice versa."""
+    issues = []
+    for term in sp.objective.terms:
+        if term.expression_type == "quadratic" and term.output_form == "linear_cost":
+            issues.append(
+                f"Objective term '{term.id}' has expression_type='quadratic' but "
+                f"output_form='linear_cost'. Quadratic terms cannot produce linear cost."
+            )
+        if term.output_form == "quadratic_penalty" and term.approximation == "first_order":
+            issues.append(
+                f"Objective term '{term.id}' has output_form='quadratic_penalty' but "
+                f"approximation='first_order'. First-order approximation cannot "
+                f"produce a quadratic penalty."
+            )
+    if issues:
+        return ValidationCheck(
+            name="quadratic_not_mislabeled_as_linear",
+            passed=False,
+            detail="; ".join(issues),
+        )
+    return ValidationCheck(name="quadratic_not_mislabeled_as_linear", passed=True)
+
+
+def _check_slack_penalty_refs_exist(sp: SubProblemDef) -> ValidationCheck:
+    """Slack penalty terms must reference variables that exist in extra_variables."""
+    extra_var_names = {v.name for v in sp.variables.extra_variables}
+    issues = []
+    for term in sp.objective.terms:
+        if term.role == "slack_penalty":
+            refs = _extract_identifiers(term.expr)
+            for ref in refs:
+                if ref in extra_var_names:
+                    continue  # found
+                # Also check node variables
+                node_names = {v.name for v in sp.variables.node_variables}
+                if ref in node_names:
+                    continue
+                # Check parameters
+                if ref in sp.parameters:
+                    continue
+                issues.append(
+                    f"Objective term '{term.id}' (slack_penalty) references "
+                    f"'{ref}' which is not found in extra_variables, "
+                    f"node_variables, or parameters"
+                )
+    if issues:
+        return ValidationCheck(
+            name="slack_penalty_references_exist",
+            passed=False,
+            detail="; ".join(issues),
+        )
+    return ValidationCheck(name="slack_penalty_references_exist", passed=True)
+
+
+def _check_trust_region_has_scope(sp: SubProblemDef) -> ValidationCheck:
+    """Trust region penalty terms must have a defined grid/scope."""
+    issues = []
+    for term in sp.objective.terms:
+        if term.role == "trust_region_penalty":
+            if not term.grid or term.grid.strip() == "":
+                issues.append(
+                    f"Objective term '{term.id}' (trust_region_penalty) has "
+                    f"empty 'grid'. Must specify scope (e.g. grid='node')."
+                )
+    if issues:
+        return ValidationCheck(
+            name="trust_region_penalty_has_scope",
+            passed=False,
+            detail="; ".join(issues),
+        )
+    return ValidationCheck(name="trust_region_penalty_has_scope", passed=True)
+
+
+def _check_time_variable(sp: SubProblemDef) -> ValidationCheck:
+    """
+    Three-way time variable validation based on interval_mode + discretization_mode.
+
+    - fixed_interval: No time variable of any kind.
+    - optimizable_uniform_interval + perturbation: time_variable=dT, role=time_perturbation.
+    - optimizable_uniform_interval + direct: time_variable=T, role=time_interval.
+    """
+    mode = sp.time.interval_mode
+    disc_mode = sp.meta.discretization_mode
+    tv = sp.time.time_variable
+    tvr = sp.time.time_variable_role
+    extra_vars = sp.variables.extra_variables
+
+    # ── Rule 1: fixed_interval → no time variable ──
+    if mode == "fixed_interval":
+        if tv is not None:
+            return ValidationCheck(
+                name="time_variable_three_way",
+                passed=False,
+                detail=f"interval_mode is fixed_interval but time_variable='{tv}' is set",
+            )
+        # Check no extra variable has a time role
+        stray = [v.name for v in extra_vars if v.role in ("time_perturbation", "time_interval")]
+        if stray:
+            return ValidationCheck(
+                name="time_variable_three_way",
+                passed=False,
+                detail=f"fixed_interval mode but extra variables have time roles: {stray}",
+            )
+        return ValidationCheck(name="time_variable_three_way", passed=True)
+
+    # ── Rule 2: optimizable_uniform_interval + perturbation ──
+    if mode == "optimizable_uniform_interval" and disc_mode == "perturbation":
+        if tv is None:
+            return ValidationCheck(
+                name="time_variable_three_way",
+                passed=False,
+                detail="optimizable_uniform_interval + perturbation requires time_variable (e.g. dT)",
+            )
+        if tvr != "time_perturbation":
+            return ValidationCheck(
+                name="time_variable_three_way",
+                passed=False,
+                detail=f"expected time_variable_role='time_perturbation', got '{tvr}'",
+            )
+        found = any(v.name == tv and v.role == "time_perturbation" for v in extra_vars)
         if not found:
             return ValidationCheck(
-                name="time_perturbation_variable_present_if_optimizable",
+                name="time_variable_three_way",
                 passed=False,
-                detail=f"perturbation_variable '{sp.time.perturbation_variable}' not found in extra_variables",
+                detail=f"time_variable '{tv}' (role=time_perturbation) not found in extra_variables",
             )
-    return ValidationCheck(name="time_perturbation_variable_present_if_optimizable", passed=True)
+        return ValidationCheck(name="time_variable_three_way", passed=True)
 
-
-def _check_no_time_perturbation_if_fixed(sp: SubProblemDef) -> ValidationCheck:
-    """If interval_mode is fixed_interval, no dT must exist."""
-    if sp.time.interval_mode == "fixed_interval":
-        if sp.time.perturbation_variable is not None:
+    # ── Rule 3: optimizable_uniform_interval + direct ──
+    if mode == "optimizable_uniform_interval" and disc_mode == "direct":
+        if tv is None:
             return ValidationCheck(
-                name="no_time_perturbation_variable_if_fixed_interval",
+                name="time_variable_three_way",
                 passed=False,
-                detail=f"interval_mode is fixed_interval but perturbation_variable='{sp.time.perturbation_variable}' is set",
+                detail="optimizable_uniform_interval + direct requires time_variable (e.g. T)",
             )
-    return ValidationCheck(name="no_time_perturbation_variable_if_fixed_interval", passed=True)
+        if tvr != "time_interval":
+            return ValidationCheck(
+                name="time_variable_three_way",
+                passed=False,
+                detail=f"expected time_variable_role='time_interval', got '{tvr}'",
+            )
+        found = any(v.name == tv and v.role == "time_interval" for v in extra_vars)
+        if not found:
+            return ValidationCheck(
+                name="time_variable_three_way",
+                passed=False,
+                detail=f"time_variable '{tv}' (role=time_interval) not found in extra_variables",
+            )
+        # perturbation_variable is allowed to be None in direct mode
+        return ValidationCheck(name="time_variable_three_way", passed=True)
+
+    # ── Unknown combination ──
+    return ValidationCheck(
+        name="time_variable_three_way",
+        passed=False,
+        detail=f"unexpected interval_mode='{mode}' + discretization_mode='{disc_mode}'",
+    )
 
 
 def _check_row_end_formula(sp: SubProblemDef) -> ValidationCheck:
@@ -410,3 +625,119 @@ def _check_row_end_formula(sp: SubProblemDef) -> ValidationCheck:
             detail="; ".join(issues),
         )
     return ValidationCheck(name="row_end_matches_row_start_plus_count_minus_one", passed=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scale reference validation helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _check_scale_references(
+    sp: SubProblemDef,
+    original_scales: Optional[Dict[str, object]],
+) -> ValidationCheck:
+    """
+    Verify that every scale referenced by a variable or parameter exists
+    in the resolved scale_table.
+
+    Note: We only check direct scale references (node variable scales, extra
+    variable scales, parameter scales). We do NOT extract identifiers from
+    expression strings — that is a Stage 2 concern (expression parsing).
+    The scale_table contains physical dimension scales (length, velocity, etc.),
+    not variable/parameter names.
+    """
+    scale_table = sp.scale_table
+    if not scale_table:
+        return ValidationCheck(
+            name="all_scale_references_resolved",
+            passed=True,
+            detail="scale_table is empty",
+        )
+
+    missing: List[str] = []
+    seen: Set[str] = set()
+
+    def check_scale(scale_name: str, context: str):
+        if scale_name and scale_name not in seen:
+            seen.add(scale_name)
+            if scale_name not in scale_table:
+                missing.append(f"'{scale_name}' (referenced by {context})")
+
+    # ── Node variables: check their scale names ──
+    for v in sp.variables.node_variables:
+        check_scale(v.scale, f"node variable '{v.name}'")
+
+    # ── Extra variables: check their scale names ──
+    for v in sp.variables.extra_variables:
+        check_scale(v.scale, f"extra variable '{v.name}'")
+
+    # ── Parameters: check their scale names ──
+    for param_name, scale_name in sp.parameters.items():
+        check_scale(scale_name, f"parameter '{param_name}'")
+
+    # ── Extra variables from transcription time effects ──
+    if original_scales and "extra_variables" in original_scales:
+        evars = original_scales["extra_variables"]
+        if isinstance(evars, list):
+            for item in evars:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    name, scale_name = item[0], item[1]
+                    if scale_name:
+                        check_scale(scale_name, f"introduced variable '{name}'")
+                elif isinstance(item, dict) and "scale" in item:
+                    scale_name = item.get("scale", "")
+                    if scale_name:
+                        check_scale(scale_name, f"introduced variable '{item.get('name', '?')}'")
+
+    if missing:
+        return ValidationCheck(
+            name="all_scale_references_resolved",
+            passed=False,
+            detail=f"Missing scales in resolved scale_table: {'; '.join(missing)}",
+        )
+    return ValidationCheck(name="all_scale_references_resolved", passed=True)
+
+
+def _check_scale_table_complete(sp: SubProblemDef) -> ValidationCheck:
+    """
+    Verify that the resolved scale_table has no missing (None/NaN) values
+    and that all entries are finite numbers.
+    """
+    issues: List[str] = []
+
+    for name, value in sp.scale_table.items():
+        if value is None:
+            issues.append(f"scale '{name}' has null value (not resolved)")
+        elif not isinstance(value, (int, float)):
+            issues.append(f"scale '{name}' has non-numeric value: {type(value).__name__}")
+        elif not (-1e300 < value < 1e300):
+            issues.append(f"scale '{name}' has non-finite value: {value}")
+
+    if issues:
+        return ValidationCheck(
+            name="scale_table_all_values_finite",
+            passed=False,
+            detail="; ".join(issues),
+        )
+    return ValidationCheck(name="scale_table_all_values_finite", passed=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Token extraction helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_identifiers(expr: str) -> Set[str]:
+    """
+    Extract identifier tokens from an expression string, excluding Python
+    keywords, builtins, and common math functions.
+    """
+    import re
+    tokens = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+
+    reserved = {
+        'abs', 'bool', 'complex', 'dict', 'float', 'int', 'list',
+        'max', 'min', 'round', 'str', 'sum', 'True', 'False', 'None',
+        'and', 'or', 'not', 'in', 'is', 'lambda', 'pass', 'yield',
+        'sin', 'cos', 'tan', 'exp', 'log', 'log10', 'log2',
+        'pow', 'fabs', 'floor', 'ceil', 'trunc', 'sqrt',
+    }
+    return {t for t in tokens if t not in reserved}

@@ -1,16 +1,14 @@
 """
-scpgen — SCP/SOCP Problem Description → CSC Sparse Matrix Fill C Code Generator.
-
-Reads a two-layer YAML problem description (model + transcription),
-performs symbolic differentiation & normalization via SymPy, freezes CSC
-sparsity patterns, and generates C source files for matrix fill routines.
-
-Scope: problem → SOCP data matrix fill code only.
-NOT included: solver, KKT analysis, LDLT decomposition.
+scpgen — Stage 1: Original YAML → Subproblem YAML Compiler.
 
 Usage:
-    python -m scpgen validate examples/ascent.yaml
-    python -m scpgen generate examples/ascent.yaml -o output/
+    python -m scpgen compile          <original.yaml> [-o output/]
+    python -m scpgen validate-original <original.yaml>
+    python -m scpgen validate-subproblem <subproblem.yaml>
+
+Stage 1 compiles an original problem YAML into a subproblem YAML,
+which contains fully-expanded variable/constraint layout for downstream
+C code generation (Stage 2).
 """
 
 import sys

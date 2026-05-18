@@ -41,6 +41,13 @@ class SubproblemCompiler:
         self.problem = problem
         self._subproblem: Optional[SubProblemDef] = None
 
+        # ── Guard: only node control grid is currently supported ──
+        if problem.grid.control_grid != "node":
+            raise ValueError(
+                f"control_grid='{problem.grid.control_grid}' is not yet supported. "
+                "Currently only control_grid='node' is implemented."
+            )
+
         # Internal state during compilation
         self._next_extra_col: int = 0
         self._next_A_row: int = 0
@@ -56,10 +63,14 @@ class SubproblemCompiler:
         equalities = self._allocate_equality_rows(dims)
         inequalities = self._allocate_inequality_rows(dims)
         objective = self._process_objective_terms()
+
+        # Update dimensions with actual objective term count (post-processing)
+        dims.objective_terms = len(objective.terms)
+
         validation = self._build_validation_section()
 
-        # Copy scale table, expressions, and dynamics from original problem
-        scale_table = dict(self.problem.scales)
+        # Copy scale table (resolved to numeric values), expressions, and dynamics from original problem
+        scale_table = self.problem.scales.resolve_all()
         expressions = [
             {"name": e.name, "expr": e.expr}
             for e in self.problem.model.expressions
@@ -105,19 +116,22 @@ class SubproblemCompiler:
 
         # Count extra variables
         n_extra = 0
-        # Time effects
-        for _ in p.transcription.time_effects.introduces_variables:
+
+        # ── Time variable (compiler built-in rule) ──
+        # Based on grid.time.interval_mode + transcription.discretization_mode
+        if self._time_is_optimizable():
             n_extra += 1
+
         # Operation effects
         for op in p.transcription.operations:
             if op.effects:
                 for _ in op.effects.introduces_variables:
                     n_extra += 1
 
-        # Count objective terms
+        # Count objective terms (all operations with export="objective")
         n_obj_terms = 0
         for op in p.transcription.operations:
-            if op.operation == "discretize_objective_integral":
+            if op.export == "objective":
                 n_obj_terms += len(op.all_sources)
             if op.effects:
                 n_obj_terms += len(op.effects.adds_objective_terms)
@@ -181,17 +195,29 @@ class SubproblemCompiler:
         return entries
 
     def _allocate_extra_variables(self) -> List[ExtraVarEntry]:
-        """Allocate extra variables from time effects and operation effects."""
+        """Allocate extra variables from compiler built-in rules and operation effects."""
         entries: List[ExtraVarEntry] = []
         p = self.problem
 
-        # ── Time perturbation variable ──
-        time_eff = p.transcription.time_effects
-        for iv in time_eff.introduces_variables:
+        # ── Time variable (compiler built-in rule) ──
+        # Based on grid.time.interval_mode + transcription.discretization_mode:
+        #   fixed_interval:              no time variable
+        #   optimizable_uniform_interval + perturbation: dT (time_perturbation)
+        #   optimizable_uniform_interval + direct:       T  (time_interval)
+        if self._time_is_optimizable():
+            grid_time = p.grid.time
+            disc_mode = p.transcription.discretization_mode
+            if disc_mode == "perturbation":
+                var_name = grid_time.perturbation_symbol  # "dT"
+                role = "time_perturbation"
+            else:  # direct
+                var_name = grid_time.interval_symbol  # "T"
+                role = "time_interval"
+
             entries.append(ExtraVarEntry(
-                name=iv.name, role=iv.role, grid=iv.grid,
-                scale=iv.scale, col=self._next_extra_col,
-                source="transcription.time",
+                name=var_name, role=role, grid="scalar",
+                scale="time", col=self._next_extra_col,
+                source="compiler.time",
             ))
             self._next_extra_col += 1
 
@@ -253,11 +279,11 @@ class SubproblemCompiler:
         self._next_A_row += row_count
         row_end = row_start + row_count - 1
 
-        src_model = op.source or (op.all_sources[0] if op.all_sources else "")
+        src_models = [op.source] if op.source else list(op.all_sources)
 
         return EqualityBlock(
             id=op.id,
-            source_model=src_model,
+            source_models=src_models,
             source_operation=op.operation,
             export="A_b",
             row_start=row_start,
@@ -310,7 +336,7 @@ class SubproblemCompiler:
 
         return EqualityBlock(
             id=op.id,
-            source_model=", ".join(op.all_sources),
+            source_models=list(op.all_sources),
             source_operation=op.operation,
             export="A_b",
             row_start=row_start,
@@ -331,13 +357,12 @@ class SubproblemCompiler:
         blocks: List[InequalityBlock] = []
         self._next_G_row = 0
 
-        # ── Time constraints (if optimizable) ──
-        time_eff = p.transcription.time_effects
-        if time_eff.new_constraints:
-            for nc in time_eff.new_constraints:
-                blk = self._ineq_scalar_constraint(nc, source_operation="transcription.time")
-                if blk:
-                    blocks.append(blk)
+        # ── Time bounds: compiler auto-generated total_time constraints ──
+        # Based on grid.time.bounds + transcription.discretization_mode.
+        # The bounds [tf_min, tf_max] in grid.time are parameter names.
+        if self._time_is_optimizable() and p.grid.time.bounds:
+            blks = self._ineq_time_bounds_auto()
+            blocks.extend(blks)
 
         for op in p.transcription.operations:
             if op.export != "G_h":
@@ -363,11 +388,11 @@ class SubproblemCompiler:
         self._next_G_row += 1
         row_end = row_start
 
-        rng = self._format_range(nc.range, self.problem.final_node, nc.grid)
+        rng = self._format_range(nc.range, nc.grid, self.problem.N)
 
         return InequalityBlock(
             id=nc.id,
-            source_model="",
+            source_models=[],
             source_operation=source_operation,
             export="G_h",
             row_start=row_start,
@@ -380,6 +405,77 @@ class SubproblemCompiler:
             G_rows=[row_start, row_end],
         )
 
+    def _ineq_time_bounds_auto(self) -> List[InequalityBlock]:
+        """
+        Auto-generate total time G constraints from grid.time.bounds.
+
+        Called when interval_mode == "optimizable_uniform_interval" and bounds are given.
+
+        The constraints depend on discretization_mode:
+          - perturbation: tf_min - N*(T_ref + dT) <= 0   and   N*(T_ref + dT) - tf_max <= 0
+          - direct:       tf_min - N*T <= 0               and   N*T - tf_max <= 0
+
+        Returns two InequalityBlocks (lower + upper), each with 1 scalar row.
+        """
+        p = self.problem
+        grid_time = p.grid.time
+        disc_mode = p.transcription.discretization_mode
+        bounds = grid_time.bounds  # [tf_min_param, tf_max_param]
+        N = p.N
+
+        if disc_mode == "perturbation":
+            ref_sym = grid_time.reference_interval_symbol   # "T_ref"
+            pert_sym = grid_time.perturbation_symbol         # "dT"
+            total_expr = f"{N} * ({ref_sym} + {pert_sym})"
+        else:  # direct
+            int_sym = grid_time.interval_symbol              # "T"
+            total_expr = f"{N} * {int_sym}"
+
+        tf_min = bounds[0] if len(bounds) > 0 else "tf_min"
+        tf_max = bounds[1] if len(bounds) > 1 else "tf_max"
+
+        blocks: List[InequalityBlock] = []
+
+        # Lower bound: tf_min - total_expr <= 0
+        lower_start = self._next_G_row
+        self._next_G_row += 1
+        blocks.append(InequalityBlock(
+            id="total_time_lower",
+            source_models=["grid.time"],
+            source_operation="compiler.time",
+            export="G_h",
+            row_start=lower_start,
+            row_count=1,
+            row_end=lower_start,
+            grid="scalar",
+            range=None,
+            processor="total_time_bounds",
+            bound_type="lower",
+            expr=f"{tf_min} - {total_expr} <= 0",
+            G_rows=[lower_start, lower_start],
+        ))
+
+        # Upper bound: total_expr - tf_max <= 0
+        upper_start = self._next_G_row
+        self._next_G_row += 1
+        blocks.append(InequalityBlock(
+            id="total_time_upper",
+            source_models=["grid.time"],
+            source_operation="compiler.time",
+            export="G_h",
+            row_start=upper_start,
+            row_count=1,
+            row_end=upper_start,
+            grid="scalar",
+            range=None,
+            processor="total_time_bounds",
+            bound_type="upper",
+            expr=f"{total_expr} - {tf_max} <= 0",
+            G_rows=[upper_start, upper_start],
+        ))
+
+        return blocks
+
     def _ineq_affine_bounds(self, op: OperationDecl,
                              dims: SubDimensions) -> List[InequalityBlock]:
         """Affine bounds: box constraints split into lower/upper, simple inequalities."""
@@ -391,7 +487,7 @@ class SubproblemCompiler:
             if ineq is None:
                 continue
 
-            nodes = self._resolve_range(ineq.range, p.final_node)
+            nodes = self._resolve_range(ineq.range, ineq.grid, p.N)
             n_nodes_in_range = len(nodes)
 
             expr = ineq.expr
@@ -412,7 +508,7 @@ class SubproblemCompiler:
                 lower_end = lower_start + lower_count - 1
                 blocks.append(InequalityBlock(
                     id=f"{ineq.inequality_id}_lower",
-                    source_model=src_path,
+                    source_models=[src_path],
                     source_operation=op.operation,
                     export="G_h",
                     row_start=lower_start,
@@ -433,7 +529,7 @@ class SubproblemCompiler:
                 upper_end = upper_start + upper_count - 1
                 blocks.append(InequalityBlock(
                     id=f"{ineq.inequality_id}_upper",
-                    source_model=src_path,
+                    source_models=[src_path],
                     source_operation=op.operation,
                     export="G_h",
                     row_start=upper_start,
@@ -458,7 +554,7 @@ class SubproblemCompiler:
 
                 blocks.append(InequalityBlock(
                     id=ineq.inequality_id,
-                    source_model=src_path,
+                    source_models=[src_path],
                     source_operation=op.operation,
                     export="G_h",
                     row_start=row_start,
@@ -489,7 +585,7 @@ class SubproblemCompiler:
                     nodes = []
                     rng = None
                 else:
-                    nodes = self._resolve_range(rc.range, p.final_node)
+                    nodes = self._resolve_range(rc.range, rc.grid, p.N)
                     row_count = len(nodes)
                     rng = [nodes[0], nodes[-1]]
 
@@ -503,7 +599,7 @@ class SubproblemCompiler:
 
                 blocks.append(InequalityBlock(
                     id=rc.id,
-                    source_model=src_path,
+                    source_models=[src_path],
                     source_operation=op.id,
                     export="G_h",
                     row_start=row_start,
@@ -517,7 +613,7 @@ class SubproblemCompiler:
                 ))
         else:
             if ineq:
-                nodes = self._resolve_range(ineq.range, p.final_node)
+                nodes = self._resolve_range(ineq.range, ineq.grid, p.N)
                 n_nodes = len(nodes)
                 row_count = n_nodes
                 rng = [nodes[0], nodes[-1]]
@@ -528,7 +624,7 @@ class SubproblemCompiler:
 
                 blocks.append(InequalityBlock(
                     id=ineq.inequality_id,
-                    source_model=src_path,
+                    source_models=[src_path],
                     source_operation=op.id,
                     export="G_h",
                     row_start=row_start,
@@ -547,38 +643,144 @@ class SubproblemCompiler:
     # Phase 2.3: Objective Terms
     # ══════════════════════════════════════════════════════════════════════
 
+    # ── Operation → ObjectiveTerm semantics mapping ──
+    _OBJECTIVE_OP_TABLE = {
+        "linearize_objective": {
+            "role": "original_cost",
+            "expression_type": "nonlinear",
+            "approximation": "first_order",
+            "output_form": "linear_cost",
+            "reference_dependent": True,
+            "stage2_action": "linearize_objective",
+            "stage3_action": "keep_linear_cost",
+        },
+        "keep_quadratic_penalty": {
+            "role": "smoothing_penalty",
+            "expression_type": "quadratic",
+            "approximation": "exact_quadratic",
+            "output_form": "quadratic_penalty",
+            "reference_dependent": False,
+            "stage2_action": "discretize_objective",
+            "stage3_action": "convert_quadratic_to_socp",
+        },
+        "add_trust_region_penalty": {
+            "role": "trust_region_penalty",
+            "expression_type": "quadratic",
+            "approximation": "exact_quadratic",
+            "output_form": "quadratic_penalty",
+            "reference_dependent": True,
+            "stage2_action": "keep_as_is",
+            "stage3_action": "convert_quadratic_to_socp",
+        },
+        "keep_linear_term": {
+            "role": "original_cost",
+            "expression_type": "affine",
+            "approximation": "exact_affine",
+            "output_form": "linear_cost",
+            "reference_dependent": False,
+            "stage2_action": "keep_as_is",
+            "stage3_action": "keep_linear_cost",
+        },
+    }
+
     def _process_objective_terms(self) -> SubObjective:
-        """Collect objective terms from model and transcription effects."""
+        """Collect objective terms from model objectives and transcription effects.
+
+        For each operation with export="objective":
+          - Use op.operation + op.approximation to determine semantics
+          - Resolve model.objective.<id> sources for expr, weight, grid, range
+          - If op.role_override is set, it overrides the table's default role.
+          - Strict: missing approximation raises ValueError.
+
+        For each operation's effects.adds_objective_terms:
+          - Use AddedObjectiveTerm's own role/expression_type fields.
+          - Automatically set source_effect and source_model for traceability.
+        """
         p = self.problem
         terms: List[ObjectiveTerm] = []
 
         for op in p.transcription.operations:
-            if op.operation == "discretize_objective_integral":
+            # ── Model-level objective terms (export="objective") ──
+            if op.export == "objective" and op.all_sources:
+                semantics = self._OBJECTIVE_OP_TABLE.get(op.operation)
+                if semantics is None:
+                    raise ValueError(
+                        f"Operation '{op.id}' has export='objective' but unknown "
+                        f"operation='{op.operation}'. Supported: "
+                        f"{list(self._OBJECTIVE_OP_TABLE.keys())}"
+                    )
+                if op.approximation is None:
+                    raise ValueError(
+                        f"Operation '{op.id}' (export=objective) is missing required "
+                        f"'approximation' sub-block (method, about, output_form)."
+                    )
+
+                # ── Role: explicit override > table default ──
+                role = op.role_override or semantics["role"]
+
                 for src_path in op.all_sources:
                     obj = self._resolve_objective_source(src_path)
                     if obj:
-                        expr_str = f"{obj.weight} * ({obj.integrand})" if obj.weight else obj.integrand
-                        nodes = self._resolve_range(obj.range, p.final_node)
+                        expr_str = (
+                            f"{obj.weight} * ({obj.expr})" if obj.weight else obj.expr
+                        )
+                        nodes = self._resolve_range(obj.range, obj.grid, p.N)
                         rng = [nodes[0], nodes[-1]] if nodes else None
-                        term_type = "integral_quadratic" if self._is_quadratic_expr(obj.integrand) else "integral_linear"
+
+                        # ── Quadrature: explicit override > inferred from grid ──
+                        quad, agg, twp = self._infer_quadrature(
+                            obj.grid, semantics, op.approximation
+                        )
+
+                        stage2 = semantics["stage2_action"]
+                        stage3 = semantics["stage3_action"]
+                        next_stage = f"{stage2}_then_{stage3}"
+
                         terms.append(ObjectiveTerm(
                             id=obj.objective_id,
                             source_model=src_path,
                             source_operation=op.id,
-                            type=term_type,
+                            source_effect="",
+                            role=role,
+                            expression_type=semantics["expression_type"],
+                            approximation=(
+                                op.approximation.method or semantics["approximation"]
+                            ),
+                            reference_dependent=semantics["reference_dependent"],
+                            output_form=(
+                                op.approximation.output_form or semantics["output_form"]
+                            ),
+                            stage2_action=stage2,
+                            stage3_action=stage3,
+                            next_stage_action=next_stage,
+                            quadrature=quad,
+                            aggregation=agg,
+                            time_weight_policy=twp,
                             grid=obj.grid,
                             range=rng,
                             expr=expr_str,
                         ))
 
+            # ── Added objective terms from effects (slack penalties, etc.) ──
             if op.effects and op.effects.adds_objective_terms:
                 for ao in op.effects.adds_objective_terms:
-                    term_type = "scalar_quadratic" if self._is_quadratic_expr(ao.expr) else "linear"
+                    source_effect = f"{op.id}.effects.adds_objective_terms.{ao.id}"
                     terms.append(ObjectiveTerm(
-                        id=f"{op.id}_penalty",
-                        source_model="",
+                        id=ao.id,
+                        source_model=op.source,
                         source_operation=op.id,
-                        type=term_type,
+                        source_effect=source_effect,
+                        role=ao.role,
+                        expression_type=ao.expression_type or "quadratic",
+                        approximation=ao.approximation,
+                        reference_dependent=False,
+                        output_form=ao.output_form or "quadratic_penalty",
+                        stage2_action="keep_as_is",
+                        stage3_action="convert_quadratic_to_socp",
+                        next_stage_action="keep_as_is_then_convert_quadratic_to_socp",
+                        quadrature="none",
+                        aggregation="none",
+                        time_weight_policy="none",
                         grid="scalar",
                         range=None,
                         expr=ao.expr,
@@ -586,9 +788,53 @@ class SubproblemCompiler:
 
         return SubObjective(terms=terms)
 
+    @staticmethod
+    def _infer_quadrature(
+        grid: str,
+        semantics: dict,
+        approx,
+    ) -> tuple:
+        """Infer quadrature/aggregation/time_weight_policy defaults from grid type.
+
+        Explicit overrides from approx (ApproximationDecl) take precedence.
+        """
+        # Start with explicit overrides from approximation block
+        quad = approx.quadrature if approx and approx.quadrature else ""
+        agg = approx.aggregation if approx and approx.aggregation else ""
+        twp = approx.time_weight_policy if approx and approx.time_weight_policy else ""
+
+        # If no explicit override, infer from grid
+        if not quad:
+            if grid in ("node", "interval"):
+                quad = "trapezoidal"
+            else:
+                quad = "none"
+
+        if not agg:
+            if grid in ("node", "interval"):
+                agg = "integral"
+            else:
+                agg = "none"
+
+        if not twp:
+            if grid in ("node", "interval"):
+                twp = "T_ref_plus_dT"
+            else:
+                twp = "none"
+
+        return (quad, agg, twp)
+
     # ══════════════════════════════════════════════════════════════════════
     # Helpers
     # ══════════════════════════════════════════════════════════════════════
+
+    def _time_is_optimizable(self) -> bool:
+        """Check if time interval is an optimization variable.
+
+        Returns True for optimizable_uniform_interval (both perturbation and direct modes).
+        Returns False for fixed_interval.
+        """
+        return self.problem.grid.time.interval_mode == "optimizable_uniform_interval"
 
     def _resolve_equality_source(self, src_path: str) -> Optional[OrigEqualityDef]:
         """Resolve 'model.equalities.<id>' → OrigEqualityDef."""
@@ -623,48 +869,57 @@ class SubproblemCompiler:
         return None
 
     @staticmethod
-    def _resolve_range(range_spec, final_node: int) -> List[int]:
-        """Resolve range spec → list of node indices."""
+    def _resolve_range(range_spec, grid: str, N: int) -> List[int]:
+        """Resolve range spec → list of node/interval indices, grid-aware.
+
+        grid="node":     "all" or None → [0, 1, ..., N]       (N+1 nodes)
+        grid="interval": "all" or None → [0, 1, ..., N-1]     (N intervals)
+        grid="scalar":   → []  (no expansion)
+        """
+        if grid == "scalar":
+            return []
         if range_spec is None or range_spec == "all":
-            return list(range(final_node + 1))
+            if grid in ("interval", "edge"):
+                return list(range(N))
+            else:
+                return list(range(N + 1))  # node grid
         if isinstance(range_spec, list) and len(range_spec) == 2:
             start = range_spec[0]
             end = range_spec[1]
             if isinstance(start, str) and start.upper() == "N":
-                start = final_node
+                start = N
             if isinstance(end, str) and end.upper() == "N":
-                end = final_node
+                end = N
             start = int(start)
             end = int(end)
             return list(range(start, end + 1))
-        return list(range(final_node + 1))
+        # Fallback
+        if grid in ("interval", "edge"):
+            return list(range(N))
+        return list(range(N + 1))
 
     @staticmethod
-    def _format_range(range_spec, final_node: int, grid: str = "node") -> Optional[List[int]]:
-        """Format range as concrete [start, end] list for output. Never returns 'all'."""
+    def _format_range(range_spec, grid: str, N: int) -> Optional[List[int]]:
+        """Format range as concrete [start, end] list for output. Never returns 'all'.
+
+        grid="node":     "all" → [0, N]
+        grid="interval": "all" → [0, N-1]
+        grid="scalar":   → None
+        """
         if grid == "scalar":
             return None
         if range_spec is None or range_spec == "all":
-            return [0, final_node]
+            if grid in ("interval", "edge"):
+                return [0, N - 1]
+            return [0, N]
         if isinstance(range_spec, list) and len(range_spec) == 2:
             s, e = range_spec[0], range_spec[1]
             if isinstance(s, str) and s.upper() == "N":
-                s = final_node
+                s = N
             if isinstance(e, str) and e.upper() == "N":
-                e = final_node
+                e = N
             return [int(s), int(e)]
         return None
-
-    @staticmethod
-    def _is_quadratic_expr(expr: str) -> bool:
-        """Detect if expression contains quadratic terms."""
-        # Match patterns like x^2, x**2, x[k]*x[k], or cross terms like x[k]*y[k]
-        patterns = [
-            r'\w+\s*\^\s*2',        # x^2
-            r'\w+\s*\*\*\s*2',      # x**2
-            r'\w+\[k\]\s*\*\s*\w+\[k\]',  # x[k]*x[k] or x[k]*y[k]
-        ]
-        return any(re.search(p, expr) for p in patterns)
 
     @staticmethod
     def _split_box_expr(expr: str) -> Tuple[str, str]:
@@ -692,28 +947,75 @@ class SubproblemCompiler:
     # ══════════════════════════════════════════════════════════════════════
 
     def _build_time_info(self) -> SubTime:
-        """Build the time section for subproblem YAML."""
+        """
+        Build the time section for subproblem YAML.
+
+        Uses compiler built-in rules based on:
+          - grid.time.interval_mode
+          - transcription.discretization_mode (perturbation | direct)
+
+        fixed_interval:
+          No perturbation variable, no perturbed interval, total_time = N * T.
+
+        optimizable_uniform_interval + perturbation:
+          perturbation_variable = dT (from TimeDef.perturbation_symbol)
+          perturbed_interval_expr = "T_ref + dT"
+          total_time_expr = "N * (T_ref + dT)"
+
+        optimizable_uniform_interval + direct:
+          No perturbation variable.
+          interval_symbol = T is the optimization variable.
+          total_time_expr = "N * T"
+        """
         p = self.problem
         grid_time = p.grid.time
-        time_eff = p.transcription.time_effects
-
-        # Determine if there's a perturbation variable
-        pert_var = None
-        for iv in time_eff.introduces_variables:
-            if iv.role == "time_perturbation":
-                pert_var = iv.name
-                break
-
+        disc_mode = p.transcription.discretization_mode
         is_optimizable = grid_time.interval_mode == "optimizable_uniform_interval"
+
+        interval_sym = grid_time.interval_symbol
+        ref_sym = grid_time.reference_interval_symbol
+        pert_sym = grid_time.perturbation_symbol
+        bounds = list(grid_time.bounds) if grid_time.bounds else []
+
+        if is_optimizable and disc_mode == "perturbation":
+            pert_var = pert_sym
+            pert_expr = f"{ref_sym} + {pert_sym}"
+            total_expr = f"{p.N} * ({ref_sym} + {pert_sym})"
+            bound_ids = ["total_time_lower", "total_time_upper"] if bounds else []
+        elif is_optimizable and disc_mode == "direct":
+            pert_var = None
+            pert_expr = None
+            total_expr = f"{p.N} * {interval_sym}"
+            bound_ids = ["total_time_lower", "total_time_upper"] if bounds else []
+        else:
+            # fixed_interval
+            pert_var = None
+            pert_expr = None
+            total_expr = grid_time.total_time_expr
+            bound_ids = []
+
+        # Determine unified time_variable and role
+        if is_optimizable and disc_mode == "perturbation":
+            time_var = pert_sym
+            time_role = "time_perturbation"
+        elif is_optimizable and disc_mode == "direct":
+            time_var = interval_sym
+            time_role = "time_interval"
+        else:
+            time_var = None
+            time_role = None
 
         return SubTime(
             interval_mode=grid_time.interval_mode,
-            interval_symbol=grid_time.interval_symbol,
-            reference_interval_symbol="T_ref",
+            interval_symbol=interval_sym,
+            reference_interval_symbol=ref_sym,
+            time_variable=time_var,
+            time_variable_role=time_role,
             perturbation_variable=pert_var,
-            perturbed_interval_expr="T_ref + dT" if is_optimizable else None,
-            total_time_expr=grid_time.total_time_expr,
-            bounds=list(grid_time.bounds),
+            perturbed_interval_expr=pert_expr,
+            total_time_expr=total_expr,
+            bound_parameters=bounds,
+            bound_constraint_ids=bound_ids,
         )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -721,7 +1023,11 @@ class SubproblemCompiler:
     # ══════════════════════════════════════════════════════════════════════
 
     def _build_validation_section(self) -> SubValidation:
-        """Build the validation metadata section."""
+        """Build the validation metadata section.
+
+        The required_checks list MUST match the actual check names registered
+        in subproblem_validator.validate_subproblem().
+        """
         return SubValidation(
             row_convention=ValidationRule(),
             required_checks=[
@@ -734,9 +1040,15 @@ class SubproblemCompiler:
                 "equality_total_rows_match_neq",
                 "inequality_total_rows_match_nineq",
                 "scalar_slacks_not_expanded_as_node_variables",
-                "no_solver_specific_objective_rewrite_in_subproblem",
-                "time_perturbation_variable_present_if_optimizable",
-                "no_time_perturbation_variable_if_fixed_interval",
+                "no_solver_specific_fields",
+                "time_variable_three_way",
+                "objective_terms_have_role",
+                "nonlinear_objective_has_approximation",
+                "quadratic_not_mislabeled_as_linear",
+                "slack_penalty_references_exist",
+                "trust_region_penalty_has_scope",
                 "row_end_matches_row_start_plus_count_minus_one",
+                "all_scale_references_resolved",
+                "scale_table_all_values_finite",
             ],
         )

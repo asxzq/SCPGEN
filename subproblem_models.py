@@ -267,6 +267,7 @@ class SubProblemDef:
     parameters: Dict[str, str] = field(default_factory=dict)   # name → scale
     expressions: List[dict] = field(default_factory=list)       # [{name, expr}]
     dynamics: List[dict] = field(default_factory=list)          # [{dynamics_id, states, controls, rhs}]
+    dynamics_config: DynamicsInfo = field(default_factory=DynamicsInfo)  # Stage2 config
     time: SubTime = field(default_factory=SubTime)
     equalities: SubEqualities = field(default_factory=SubEqualities)
     inequalities: SubInequalities = field(default_factory=SubInequalities)
@@ -391,6 +392,18 @@ def subproblem_to_dict(sp: SubProblemDef) -> dict:
             }
             for d in sp.dynamics
         ],
+        # Stage2 dynamics configuration
+        "dynamics_config": {
+            "discretization": sp.dynamics_config.discretization,
+            "virtual_control": {
+                "enabled": sp.dynamics_config.virtual_control.enabled,
+                "name": sp.dynamics_config.virtual_control.name,
+                "dimension": sp.dynamics_config.virtual_control.dimension,
+                "penalty_weight": sp.dynamics_config.virtual_control.penalty_weight,
+                "penalty_type": sp.dynamics_config.virtual_control.penalty_type,
+                "location": sp.dynamics_config.virtual_control.location,
+            },
+        },
         "time": {
             "interval_mode": sp.time.interval_mode,
             "interval_symbol": sp.time.interval_symbol,
@@ -539,6 +552,22 @@ def subproblem_from_dict(d: dict) -> SubProblemDef:
         for dyn in d.get("dynamics", [])
     ]
 
+    # ── Dynamics Config (for Stage2) ──
+    dyn_cfg_d = d.get("dynamics_config", {})
+    vc_d = dyn_cfg_d.get("virtual_control", {})
+    virtual_control = VirtualControlInfo(
+        enabled=vc_d.get("enabled", False),
+        name=vc_d.get("name", "v"),
+        dimension=vc_d.get("dimension", 0),
+        penalty_weight=float(vc_d.get("penalty_weight", 0.0)),
+        penalty_type=vc_d.get("penalty_type", "quadratic"),
+        location=vc_d.get("location", "interval"),
+    )
+    dynamics_config = DynamicsInfo(
+        discretization=dyn_cfg_d.get("discretization", "trapezoidal"),
+        virtual_control=virtual_control,
+    )
+
     # ── Time ──
     time_d = d.get("time", {})
     time = SubTime(
@@ -649,6 +678,7 @@ def subproblem_from_dict(d: dict) -> SubProblemDef:
         parameters=parameters,
         expressions=expressions,
         dynamics=dynamics,
+        dynamics_config=dynamics_config,
         time=time,
         equalities=equalities,
         inequalities=inequalities,
